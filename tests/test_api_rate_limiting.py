@@ -1,4 +1,5 @@
 import os
+import pandas as pd
 import pytest
 from unittest.mock import Mock, patch, call
 
@@ -213,6 +214,75 @@ class TestRateLimiting:
         
         # Verify cache operations
         mock_cache.get_prices.assert_called_once()
+        mock_cache.set_prices.assert_called_once()
+
+    @patch('src.tools.api._cache')
+    @patch('src.tools.api.requests.get')
+    @patch('src.tools.api.yf.download')
+    def test_get_prices_uses_yfinance_without_api_key(self, mock_yf_download, mock_get, mock_cache):
+        """Test that get_prices falls back to yfinance when no Financial Datasets key is set."""
+        mock_cache.get_prices.return_value = None
+        mock_yf_download.return_value = pd.DataFrame(
+            {
+                "Open": [100.0],
+                "Close": [101.0],
+                "High": [102.0],
+                "Low": [99.0],
+                "Volume": [1000],
+            },
+            index=pd.to_datetime(["2024-01-02"]),
+        )
+
+        with patch.dict(os.environ, {"FINANCIAL_DATASETS_API_KEY": ""}):
+            result = get_prices("AAPL", "2024-01-01", "2024-01-02")
+
+        assert len(result) == 1
+        assert result[0].open == 100.0
+        assert result[0].close == 101.0
+        assert result[0].time == "2024-01-02T00:00:00Z"
+        mock_get.assert_not_called()
+        mock_yf_download.assert_called_once_with(
+            "AAPL",
+            start="2024-01-01",
+            end="2024-01-03",
+            progress=False,
+            auto_adjust=False,
+            actions=False,
+            group_by="column",
+        )
+        mock_cache.set_prices.assert_called_once()
+
+    @patch('src.tools.api._cache')
+    @patch('src.tools.api.requests.get')
+    @patch('src.tools.api.yf.download')
+    def test_get_prices_falls_back_to_yfinance_when_financial_datasets_fails(self, mock_yf_download, mock_get, mock_cache):
+        """Test that get_prices falls back to yfinance when Financial Datasets rejects a request."""
+        mock_cache.get_prices.return_value = None
+
+        mock_402_response = Mock()
+        mock_402_response.status_code = 402
+        mock_get.return_value = mock_402_response
+
+        mock_yf_download.return_value = pd.DataFrame(
+            {
+                "Open": [200.0],
+                "Close": [201.0],
+                "High": [202.0],
+                "Low": [199.0],
+                "Volume": [2000],
+            },
+            index=pd.to_datetime(["2024-01-02"]),
+        )
+
+        with patch.dict(os.environ, {"FINANCIAL_DATASETS_API_KEY": "test-key"}):
+            result = get_prices("MSFT", "2024-01-01", "2024-01-02")
+
+        assert len(result) == 1
+        assert result[0].open == 200.0
+        assert result[0].close == 201.0
+        assert result[0].time == "2024-01-02T00:00:00Z"
+        mock_get.assert_called_once()
+        mock_yf_download.assert_called_once()
         mock_cache.set_prices.assert_called_once()
 
     @patch('src.tools.api.time.sleep')

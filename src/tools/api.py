@@ -4,6 +4,7 @@ import os
 import pandas as pd
 import requests
 import time
+import yfinance as yf
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +62,7 @@ def _make_api_request(url: str, headers: dict, method: str = "GET", json_data: d
 
 
 def get_prices(ticker: str, start_date: str, end_date: str, api_key: str = None) -> list[Price]:
-    """Fetch price data from cache or API."""
+    """Fetch price data from cache, Financial Datasets, or yfinance fallback."""
     # Create a cache key that includes all parameters to ensure exact matches
     cache_key = f"{ticker}_{start_date}_{end_date}"
     
@@ -69,31 +70,98 @@ def get_prices(ticker: str, start_date: str, end_date: str, api_key: str = None)
     if cached_data := _cache.get_prices(cache_key):
         return [Price(**price) for price in cached_data]
 
-    # If not in cache, fetch from API
+    # Prefer Financial Datasets when a key is available. Without a key, or if
+    # that API rejects the request, use yfinance for price-only workflows such
+    # as technical analysis and risk management.
     headers = {}
     financial_api_key = api_key or os.environ.get("FINANCIAL_DATASETS_API_KEY")
     if financial_api_key:
         headers["X-API-KEY"] = financial_api_key
 
-    url = f"https://api.financialdatasets.ai/prices/?ticker={ticker}&interval=day&interval_multiplier=1&start_date={start_date}&end_date={end_date}"
-    response = _make_api_request(url, headers)
-    if response.status_code != 200:
-        return []
+        url = f"https://api.financialdatasets.ai/prices/?ticker={ticker}&interval=day&interval_multiplier=1&start_date={start_date}&end_date={end_date}"
+        response = _make_api_request(url, headers)
+        if response.status_code == 200:
+            # Parse response with Pydantic model
+            try:
+                price_response = PriceResponse(**response.json())
+                prices = price_response.prices
+            except Exception as e:
+                logger.warning("Failed to parse price response for %s: %s", ticker, e)
+            else:
+                if prices:
+                    # Cache the results using the comprehensive cache key
+                    _cache.set_prices(cache_key, [p.model_dump() for p in prices])
+                    return prices
 
-    # Parse response with Pydantic model
-    try:
-        price_response = PriceResponse(**response.json())
-        prices = price_response.prices
-    except Exception as e:
-        logger.warning("Failed to parse price response for %s: %s", ticker, e)
-        return []
+        logger.info(
+            "Falling back to yfinance prices for %s from %s to %s",
+            ticker,
+            start_date,
+            end_date,
+        )
 
+    prices = _get_prices_from_yfinance(ticker, start_date, end_date)
     if not prices:
         return []
 
-    # Cache the results using the comprehensive cache key
     _cache.set_prices(cache_key, [p.model_dump() for p in prices])
     return prices
+
+
+def _get_prices_from_yfinance(ticker: str, start_date: str, end_date: str) -> list[Price]:
+    """Fetch daily OHLCV prices from yfinance and normalize to Price models."""
+    try:
+        end_dt = datetime.datetime.strptime(end_date, "%Y-%m-%d").date()
+        end_exclusive = (end_dt + datetime.timedelta(days=1)).isoformat()
+        df = yf.download(
+            ticker,
+            start=start_date,
+            end=end_exclusive,
+            progress=False,
+            auto_adjust=False,
+            actions=False,
+            group_by="column",
+        )
+    except Exception as e:
+        logger.warning("Failed to fetch yfinance prices for %s: %s", ticker, e)
+        return []
+
+    if df is None or df.empty:
+        return []
+
+    if isinstance(df.columns, pd.MultiIndex):
+        for level in range(df.columns.nlevels):
+            if ticker in df.columns.get_level_values(level):
+                df = df.xs(ticker, axis=1, level=level)
+                break
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+    prices = []
+    for idx, row in df.iterrows():
+        try:
+            price = Price(
+                open=float(row["Open"]),
+                close=float(row["Close"]),
+                high=float(row["High"]),
+                low=float(row["Low"]),
+                volume=int(row["Volume"]),
+                time=_format_yfinance_time(idx),
+            )
+        except (KeyError, TypeError, ValueError) as e:
+            logger.debug("Skipping malformed yfinance price row for %s: %s", ticker, e)
+            continue
+        prices.append(price)
+
+    return prices
+
+
+def _format_yfinance_time(value) -> str:
+    """Format a yfinance date index value like the Financial Datasets API."""
+    timestamp = pd.Timestamp(value)
+    if timestamp.tzinfo is not None:
+        timestamp = timestamp.tz_convert("UTC")
+    return timestamp.strftime("%Y-%m-%dT00:00:00Z")
 
 
 def get_financial_metrics(

@@ -1,6 +1,7 @@
 """Helper functions for LLM"""
 
 import json
+import os
 from pydantic import BaseModel
 from src.llm.models import get_model, get_model_info
 from src.utils.progress import progress
@@ -48,11 +49,13 @@ def call_llm(
     model_info = get_model_info(model_name, model_provider)
     llm = get_model(model_name, model_provider, api_keys)
 
-    # For non-JSON support models, we can use structured output
     if not (model_info and not model_info.has_json_mode()):
+        provider_name = model_provider.value if hasattr(model_provider, "value") else str(model_provider)
+        uses_custom_openai_endpoint = provider_name.upper() == "OPENAI" and bool(os.getenv("OPENAI_API_BASE"))
         llm = llm.with_structured_output(
             pydantic_model,
-            method="json_mode",
+            # LM Studio rejects the json_object format emitted by json_mode.
+            method="json_schema" if uses_custom_openai_endpoint else "json_mode",
         )
 
     # Call the LLM with retries
